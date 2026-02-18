@@ -13,6 +13,7 @@ import https from "https";
 import { chromium, Browser, Page } from "playwright";
 import { fileURLToPath } from "url";
 import { dirname, join } from "path";
+import { buildViewSetupIssue, type ProjectField } from "./view-setup-template.js";
 
 // Load .env from the same directory as this script
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -428,6 +429,63 @@ const TOOLS: Tool[] = [
         repo:             { type: "string", description: `Repo name (default: ${REPO})` },
       },
       required: ["issueNumbers", "milestoneNumber"],
+    },
+  },
+  {
+    name: "create_project",
+    description: "Create a new GitHub Project with standard fields and automatically post a view-setup checklist issue to a repo. Returns project ID, number, URL, field IDs, and the setup issue number.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        title: { type: "string", description: "Project title" },
+        owner: { type: "string", description: `GitHub username (default: ${OWNER})` },
+        setupIssueRepo: { type: "string", description: `Repo to post the view-setup checklist issue to (default: ${REPO})` },
+        fields: {
+          type: "array",
+          description: "Custom SINGLE_SELECT fields to create (Status is always created). Each has a name and array of options.",
+          items: {
+            type: "object",
+            properties: {
+              name: { type: "string" },
+              options: {
+                type: "array",
+                items: {
+                  type: "object",
+                  properties: {
+                    name:        { type: "string" },
+                    color:       { type: "string", enum: ["RED","ORANGE","YELLOW","GREEN","BLUE","PURPLE","PINK","GRAY"] },
+                    description: { type: "string" },
+                  },
+                  required: ["name"],
+                },
+              },
+            },
+            required: ["name", "options"],
+          },
+        },
+        dateFields: {
+          type: "array",
+          description: "DATE fields to create for roadmap support, e.g. ['Start Date', 'Target Date']",
+          items: { type: "string" },
+        },
+        extraViews: {
+          type: "array",
+          description: "Extra views beyond the standard Table/Board/Roadmap to document in the setup issue",
+          items: {
+            type: "object",
+            properties: {
+              name:        { type: "string" },
+              type:        { type: "string", enum: ["table","board","roadmap"] },
+              description: { type: "string" },
+              groupBy:     { type: "string" },
+              filterBy:    { type: "string" },
+              sortBy:      { type: "string" },
+            },
+            required: ["name", "type", "description"],
+          },
+        },
+      },
+      required: ["title"],
     },
   },
 ];
@@ -924,6 +982,121 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         }));
 
         return ok({ updated: results.length, results });
+      }
+
+      case "create_project": {
+        const owner          = (args?.owner as string) || OWNER;
+        const setupRepo      = (args?.setupIssueRepo as string) || REPO;
+        const title          = args?.title as string;
+        const customFields   = (args?.fields as Array<{ name: string; options: Array<{ name: string; color?: string; description?: string }> }>) || [];
+        const dateFieldNames = (args?.dateFields as string[]) || [];
+        const extraViews     = (args?.extraViews as any[]) || [];
+
+        // 1. Get owner node ID
+        const userRes: any = await gql(`query { user(login: "${owner}") { id } }`);
+        const ownerId = userRes.user.id;
+
+        // 2. Create project
+        const projRes: any = await gql(`
+          mutation($ownerId: ID!, $title: String!) {
+            createProjectV2(input: { ownerId: $ownerId, title: $title }) {
+              projectV2 { id number title url }
+            }
+          }
+        `, { ownerId, title });
+        const project = projRes.createProjectV2.projectV2;
+
+        // 3. Create custom SINGLE_SELECT fields
+        const createdFields: ProjectField[] = [];
+        for (const cf of customFields) {
+          const opts = cf.options.map((o: any) => `{ name: ${JSON.stringify(o.name)}, color: ${o.color || "GRAY"}, description: ${JSON.stringify(o.description || "")} }`).join(", ");
+          const fr: any = await gql(`
+            mutation($pid: ID!, $name: String!) {
+              createProjectV2Field(input: { projectId: $pid, name: $name, dataType: SINGLE_SELECT, singleSelectOptions: [${opts}] }) {
+                projectV2Field {
+                  ... on ProjectV2SingleSelectField { id name options { id name } }
+                }
+              }
+            }
+          `, { pid: project.id, name: cf.name });
+          const f = fr.createProjectV2Field.projectV2Field;
+          createdFields.push({ id: f.id, name: f.name, type: "SINGLE_SELECT", options: f.options });
+        }
+
+        // 4. Create DATE fields
+        for (const dfName of dateFieldNames) {
+          const fr: any = await gql(`
+            mutation($pid: ID!, $name: String!) {
+              createProjectV2Field(input: { projectId: $pid, name: $name, dataType: DATE }) {
+                projectV2Field { ... on ProjectV2Field { id name dataType } }
+              }
+            }
+          `, { pid: project.id, name: dfName });
+          const f = fr.createProjectV2Field.projectV2Field;
+          createdFields.push({ id: f.id, name: f.name, type: "DATE" });
+        }
+
+        // 5. Fetch built-in Status field to include in template
+        const fieldsRes: any = await gql(`
+          query($pid: ID!) {
+            node(id: $pid) {
+              ... on ProjectV2 {
+                fields(first: 20) {
+                  nodes {
+                    ... on ProjectV2SingleSelectField { id name options { id name } }
+                    ... on ProjectV2Field { id name dataType }
+                  }
+                }
+              }
+            }
+          }
+        `, { pid: project.id });
+        const allFields: ProjectField[] = fieldsRes.node.fields.nodes
+          .filter((f: any) => f.id)
+          .map((f: any) => ({
+            id: f.id,
+            name: f.name,
+            type: (f.dataType || "SINGLE_SELECT") as ProjectField["type"],
+            options: f.options,
+          }));
+
+        // 6. Build and post the view-setup issue
+        const { title: issueTitle, body: issueBody } = buildViewSetupIssue({
+          projectTitle: title,
+          projectNumber: project.number,
+          projectUrl: project.url,
+          projectId: project.id,
+          fields: allFields,
+          extraViews,
+        });
+
+        const repoRes: any = await gql(`
+          query($owner: String!, $repo: String!) {
+            repository(owner: $owner, name: $repo) { id }
+          }
+        `, { owner, repo: setupRepo });
+
+        const issueRes: any = await gql(`
+          mutation($repoId: ID!, $title: String!, $body: String!) {
+            createIssue(input: { repositoryId: $repoId, title: $title, body: $body }) {
+              issue { id number url }
+            }
+          }
+        `, { repoId: repoRes.repository.id, title: issueTitle, body: issueBody });
+        const setupIssue = issueRes.createIssue.issue;
+
+        // Add setup issue to the project too
+        await gql(`
+          mutation($pid: ID!, $cid: ID!) {
+            addProjectV2ItemById(input: { projectId: $pid, contentId: $cid }) { item { id } }
+          }
+        `, { pid: project.id, cid: setupIssue.id });
+
+        return ok({
+          project: { id: project.id, number: project.number, title: project.title, url: project.url },
+          fields: allFields,
+          setupIssue: { number: setupIssue.number, url: setupIssue.url },
+        });
       }
 
       default:
