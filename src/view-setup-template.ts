@@ -125,7 +125,7 @@ The main overview — all items visible, sorted by priority.
 
 ---
 
-## View 2: 🗂️ Board
+## View 2: 🗂️ Board — by Status
 
 Kanban-style board with columns per ${boardGroup} option.
 
@@ -136,6 +136,21 @@ Kanban-style board with columns per ${boardGroup} option.
 ${statusField?.options ? `- [ ] Verify all columns appear:\n${statusField.options.map(o => `  - [ ] ${o.name}`).join("\n")}` : ""}
 - [ ] Open **Fields** → hide body text, show: ${selectFields.map(f => `**${f.name}**`).join(", ")}
 - [ ] Click **Save**
+
+---
+
+## View 2b: 👤 Board — by Assignee (swim lanes)
+
+Same board layout but sliced by who owns the work. This is how you separate human tasks from agent tasks at a glance.
+
+- [ ] Click **+ New view** → choose **Board**
+- [ ] Name it **"By Assignee"**
+- [ ] Set **Group by** → **Assignees**
+- [ ] Set **Column by** → **${boardGroup}** (so columns are still Status)
+- [ ] Open **Fields** → show: ${selectFields.map(f => `**${f.name}**`).join(", ")}
+- [ ] Click **Save**
+
+> **Convention:** Issues assigned to **Mxcks** are human tasks. Issues assigned to **mxcksaiworkspace-art** have an embedded 🤖 agent prompt in their body — paste it into a new Copilot chat to start that work.
 
 ---
 
