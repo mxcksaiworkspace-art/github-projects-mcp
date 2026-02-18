@@ -365,6 +365,71 @@ const TOOLS: Tool[] = [
       required: ["projectId", "itemId", "fieldId", "date"],
     },
   },
+  {
+    name: "bulk_update_project_items",
+    description: "Update field values on multiple project items in one call. Each update specifies an itemId, fieldId, and value. For single-select fields provide the option ID; for date fields provide YYYY-MM-DD; for text fields provide the string.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        projectId: { type: "string", description: "Project global node ID" },
+        updates: {
+          type: "array",
+          description: "Array of field updates to apply",
+          items: {
+            type: "object",
+            properties: {
+              itemId:  { type: "string", description: "Project item node ID (PVTI_...)" },
+              fieldId: { type: "string", description: "Field node ID" },
+              value:   { type: "string", description: "Option ID (single-select), YYYY-MM-DD (date), or plain text" },
+              type:    { type: "string", enum: ["singleSelect", "date", "text", "number"], description: "Field type — determines how value is sent (default: singleSelect)" },
+            },
+            required: ["itemId", "fieldId", "value"],
+          },
+        },
+      },
+      required: ["projectId", "updates"],
+    },
+  },
+  {
+    name: "bulk_create_issues",
+    description: "Create multiple GitHub issues in one call, optionally adding them all to a project",
+    inputSchema: {
+      type: "object",
+      properties: {
+        issues: {
+          type: "array",
+          description: "Issues to create",
+          items: {
+            type: "object",
+            properties: {
+              title:  { type: "string" },
+              body:   { type: "string" },
+              labels: { type: "array", items: { type: "string" } },
+            },
+            required: ["title"],
+          },
+        },
+        owner:         { type: "string",  description: `Repo owner (default: ${OWNER})` },
+        repo:          { type: "string",  description: `Repo name (default: ${REPO})` },
+        projectNumber: { type: "number",  description: "Add all created issues to this project number (optional)" },
+      },
+      required: ["issues"],
+    },
+  },
+  {
+    name: "bulk_set_milestones",
+    description: "Assign a single milestone to multiple issues at once",
+    inputSchema: {
+      type: "object",
+      properties: {
+        issueNumbers:     { type: "array", items: { type: "number" }, description: "Issue numbers to update" },
+        milestoneNumber:  { type: "number", description: "Milestone number to assign" },
+        owner:            { type: "string", description: `Repo owner (default: ${OWNER})` },
+        repo:             { type: "string", description: `Repo name (default: ${REPO})` },
+      },
+      required: ["issueNumbers", "milestoneNumber"],
+    },
+  },
 ];
 
 // ─── Server setup ────────────────────────────────────────────────────────────
@@ -770,6 +835,95 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           }
         `, { projectId, itemId, fieldId, date });
         return ok({ set: true, itemId, fieldId, date });
+      }
+
+      case "bulk_update_project_items": {
+        const projectId = args?.projectId as string;
+        const updates = args?.updates as Array<{ itemId: string; fieldId: string; value: string; type?: string }>;
+
+        const results = await Promise.all(updates.map(async (u) => {
+          const fieldType = u.type || "singleSelect";
+          let valueArg: object;
+          if (fieldType === "date")         valueArg = { date: u.value };
+          else if (fieldType === "text")    valueArg = { text: u.value };
+          else if (fieldType === "number")  valueArg = { number: Number(u.value) };
+          else                              valueArg = { singleSelectOptionId: u.value };
+
+          await gql(`
+            mutation($projectId: ID!, $itemId: ID!, $fieldId: ID!, $value: ProjectV2FieldValue!) {
+              updateProjectV2ItemFieldValue(input: {
+                projectId: $projectId, itemId: $itemId, fieldId: $fieldId, value: $value
+              }) { projectV2Item { id } }
+            }
+          `, { projectId, itemId: u.itemId, fieldId: u.fieldId, value: valueArg });
+
+          return { itemId: u.itemId, fieldId: u.fieldId, value: u.value, ok: true };
+        }));
+
+        return ok({ updated: results.length, results });
+      }
+
+      case "bulk_create_issues": {
+        const owner = (args?.owner as string) || OWNER;
+        const repo  = (args?.repo  as string) || REPO;
+        const issueList = args?.issues as Array<{ title: string; body?: string; labels?: string[] }>;
+        const projectNumber = args?.projectNumber as number | undefined;
+
+        const repoResult: any = await gql(`
+          query($owner: String!, $repo: String!) {
+            repository(owner: $owner, name: $repo) { id }
+          }
+        `, { owner, repo });
+        const repositoryId = repoResult.repository.id;
+
+        let projectId: string | undefined;
+        if (projectNumber) {
+          const pr: any = await gql(`
+            query($owner: String!, $number: Int!) {
+              user(login: $owner) { projectV2(number: $number) { id } }
+            }
+          `, { owner, number: projectNumber });
+          projectId = pr.user?.projectV2?.id;
+        }
+
+        const created = await Promise.all(issueList.map(async (issue) => {
+          const r: any = await gql(`
+            mutation($repositoryId: ID!, $title: String!, $body: String!) {
+              createIssue(input: { repositoryId: $repositoryId, title: $title, body: $body }) {
+                issue { id number title url }
+              }
+            }
+          `, { repositoryId, title: issue.title, body: issue.body || "" });
+          const i = r.createIssue.issue;
+
+          if (projectId) {
+            await gql(`
+              mutation($projectId: ID!, $contentId: ID!) {
+                addProjectV2ItemById(input: { projectId: $projectId, contentId: $contentId }) {
+                  item { id }
+                }
+              }
+            `, { projectId, contentId: i.id });
+          }
+
+          return { number: i.number, title: i.title, url: i.url };
+        }));
+
+        return ok({ created: created.length, issues: created });
+      }
+
+      case "bulk_set_milestones": {
+        const owner           = (args?.owner as string) || OWNER;
+        const repo            = (args?.repo  as string) || REPO;
+        const issueNumbers    = args?.issueNumbers as number[];
+        const milestoneNumber = args?.milestoneNumber as number;
+
+        const results = await Promise.all(issueNumbers.map(async (num) => {
+          const r = await restPatch(`/repos/${owner}/${repo}/issues/${num}`, { milestone: milestoneNumber });
+          return { number: (r as any).number, milestone: (r as any).milestone?.title };
+        }));
+
+        return ok({ updated: results.length, results });
       }
 
       default:
